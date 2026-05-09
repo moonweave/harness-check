@@ -8,29 +8,32 @@ Run the collector script, then generate a formatted snapshot report.
 uv run python3 ~/.claude/scripts/harness_collect.py
 ```
 
-If the JSONL scan is too slow, add `--skip-usage` to skip plugin usage stats.
+Add `--skip-usage` to skip the slow 30-day JSONL scan.
 
-The script outputs a single JSON object to stdout with these keys:
-- `settings` — full settings.json contents
+The script outputs a single JSON object to stdout:
+- `settings` — settings.json contents (env values masked)
 - `settings_local` — settings.local.json if present, else null
 - `hooks.registered` — list of {event, matcher, command, script, timeout}
 - `hooks.scripts` — {filename: {exists, syntax_ok, orphan}}
-- `hooks.orphans` — script names in hooks/ not wired in settings.json
+- `hooks.orphans` — scripts in hooks/ not wired in settings.json
+- `hooks.errors` — syntax errors detected
 - `skills` — list of skill names in ~/.claude/skills/
 - `agents` — list of {name, model, description, color}
 - `commands` — list of {name, description}
 - `kb` — {count, last_updated}
-- `health.syntax` — {script: bool} syntax check results
+- `health.syntax` — {script: bool}
 - `health.dependencies` — {binary: bool} for agent-notify / mempalace / ruff
 - `health.guards_import` — bool
 - `health.context_inject_live` — bool
+- `health.errors` — list of health check failures
 - `plugin_usage` — {skill_name: call_count} last 30 days (empty if --skip-usage)
 - `mcp_processes` — {mcp_name: process_count}
 - `project_state_top5` — [{dir, sessions, last_active, size_mb}]
+- `errors` — top-level collector failures
 
-## Step 2 — Generate the AUTO section
+## Step 2 — Generate report
 
-Read the JSON output and overwrite the `<!-- AUTO:START -->` … `<!-- AUTO:END -->` block in `~/Vaults/workspace-map/workspace_map.md` with the following structure:
+Format the JSON into a readable markdown report and present it directly in the response. Structure:
 
 ```
 ## 🔀 Hook Event Pipeline
@@ -43,12 +46,6 @@ Read the JSON output and overwrite the `<!-- AUTO:START -->` … `<!-- AUTO:END 
   PreCompact=#fbbf24, PostCompact=#2dd4bf, SubagentStart=#d97706, SessionEnd=#94a3b8
 - style fill/stroke/color (dark-theme fills)
 
-## 🔬 Research Workflow Pipeline
-
-(mermaid flowchart LR)
-- /ingest → /solve → /visualize → /draft → /ppt
-- Colors: ingest=#4ade80, solve=#60a5fa, visualize=#a78bfa, draft=#fbbf24, ppt=#f97316
-
 ## Harness Snapshot
 _Last updated: {collected_at date} — /harness-check_
 
@@ -57,7 +54,7 @@ Table of: model / advisorModel / effortLevel / language / defaultMode /
 cleanupPeriodDays / fastModePerSessionOptIn / voiceEnabled / autoMemoryEnabled /
 showThinkingSummaries / skipDangerousModePermissionPrompt
 
-env variables one line.
+env: list key names only (values are masked in collected data).
 permissions allow (one line summary). permissions deny (one line).
 settings_local: "none ✅" if null.
 
@@ -72,29 +69,28 @@ Read each script file to write the logic summary (1–2 lines).
 List hooks.orphans below the table.
 
 ### 📦 Skills
-List all skills. Note symlinks and bundles (gstack).
+List all skills. Note symlinks and bundles (e.g. gstack).
 
 ### 🤖 Agents
-Table: name | model | role summary (from description)
+Table: name | model | role summary
 
 ### 🌐 Commands
 Table: name | description
 
 ### 📚 Knowledge Base
-kb.count articles, kb.last_updated. Note if session_capture.py is not wired (deprecated).
+kb.count articles, kb.last_updated.
 
 ### 📋 CLAUDE.md Layers
 Read ~/.claude/CLAUDE.md and ~/CLAUDE.md — list section headings for each.
 
 ### 🏥 Hook Health
-Table: script | syntax | notes
-Use health.syntax — ✅ if true, ❌ if false.
-Dependencies row: agent-notify / mempalace / ruff — ✅/❌ from health.dependencies.
-guards/ import: ✅/❌ from health.guards_import.
-context_inject live test: ✅/❌ from health.context_inject_live.
+Table: script | syntax | notes (✅/❌)
+Dependencies: agent-notify / mempalace / ruff
+guards/ import result. context_inject live test result.
+If health.errors is non-empty, list each error with 🔴.
 
 ### 📊 Plugin Usage (30 days)
-If skip_usage is true: note that stats were skipped (run without --skip-usage for full data).
+If skip_usage true: note skipped, suggest running without --skip-usage.
 Otherwise: table of plugin | calls, sorted descending.
 Flag active plugins with 0 calls as 🟡.
 
@@ -102,32 +98,48 @@ Flag active plugins with 0 calls as 🟡.
 Table: MCP | count. Flag count > 1 with 🔴.
 
 ### 💾 Project State Top 5
-Table: project (last 40 chars of dir) | last active | sessions | size MB
+Table: project (last 40 chars) | last active | sessions | size MB
 
 ### 🔍 Diagnostics
-Analyze all collected data. Output table: item | type | detail
+Table: item | type | detail
 
 Types:
-- 🔴 Error: broken script path, syntax failure, missing dependency
-- 🟠 Duplicate: MCP count > 1, overlapping skills/commands
-- 🟡 Warning: active plugin with 0 calls, dangerous flags, orphan scripts
-- 🟢 Info: intentional design, deprecated items kept on purpose
-- ✅ OK: if nothing to flag
+- 🔴 Error: syntax failure, missing dependency, collector crash (errors key non-empty)
+- 🟠 Duplicate: MCP count > 1
+- 🟡 Warning: active plugin 0 calls, dangerous flags, orphan scripts
+- 🟢 Info: intentional design, deprecated items kept deliberately
+- ✅ OK: nothing to flag
 ```
 
-## Step 3 — Commit and regenerate dashboard
+## Step 3 — Persist to workspace_map (opt-in)
+
+Only run this step if the environment variable `HARNESS_CHECK_WORKSPACE_MAP` is set.
 
 ```bash
-git -C ~/Vaults/workspace-map diff --stat HEAD -- workspace_map.md
-git -C ~/Vaults/workspace-map add workspace_map.md && \
-  git -C ~/Vaults/workspace-map commit -m "harness-check: $(date +%Y-%m-%d) auto-update"
-uv run python3 ~/Vaults/workspace-map/gen_dashboard.py
+# Check if opt-in path is configured
+WORKSPACE_MAP="${HARNESS_CHECK_WORKSPACE_MAP}"
 ```
 
-Show the diff --stat to the user. Skip commit if no changes.
+If `HARNESS_CHECK_WORKSPACE_MAP` is not set, skip this step and tell the user:
+> "To save this report to a workspace_map.md file, set HARNESS_CHECK_WORKSPACE_MAP=<path> and re-run."
 
-## Notes
+If it is set:
 
-- Only overwrite the AUTO section. Never touch content outside the markers.
-- If markers are missing, append them at the end of the file.
-- All diagnostics go inside the AUTO section — no separate sections.
+1. Overwrite the `<!-- AUTO:START -->` … `<!-- AUTO:END -->` block in that file with the formatted report from Step 2. Only touch content inside the markers. If markers are missing, append them at the end.
+
+2. Commit:
+```bash
+WORKSPACE_DIR="$(dirname "${HARNESS_CHECK_WORKSPACE_MAP}")"
+git -C "${WORKSPACE_DIR}" diff --stat HEAD -- workspace_map.md
+git -C "${WORKSPACE_DIR}" add workspace_map.md && \
+  git -C "${WORKSPACE_DIR}" commit -m "harness-check: $(date +%Y-%m-%d) auto-update"
+```
+Show diff --stat. Skip commit if no changes.
+
+3. Regenerate dashboard (only if gen_dashboard.py exists):
+```bash
+DASHBOARD="${WORKSPACE_DIR}/gen_dashboard.py"
+if [ -f "${DASHBOARD}" ]; then
+  uv run python3 "${DASHBOARD}"
+fi
+```
