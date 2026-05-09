@@ -97,4 +97,4 @@ Claude will collect all settings, run the health checks, overwrite the AUTO sect
 
 ## License
 
-MIT © Moon-python
+MIT © moonweave
