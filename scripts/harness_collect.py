@@ -18,7 +18,7 @@ from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
 
-HOME = Path.home()
+HOME = Path.home().resolve()
 CLAUDE_DIR = HOME / ".claude"
 HOOKS_DIR = CLAUDE_DIR / "hooks"
 SKILLS_DIR = CLAUDE_DIR / "skills"
@@ -27,6 +27,9 @@ COMMANDS_DIR = CLAUDE_DIR / "commands"
 PROJECTS_DIR = CLAUDE_DIR / "projects"
 KNOWLEDGE_DIR = CLAUDE_DIR / "knowledge"
 SKIP_USAGE = "--skip-usage" in sys.argv
+
+# Masked in JSON output to prevent leaking secrets into workspace_map.md / git
+_MASKED = "<masked>"
 
 
 # ---------------------------------------------------------------------------
@@ -59,6 +62,14 @@ def read_frontmatter(path: Path) -> dict[str, str]:
     return result
 
 
+def _mask_settings(raw: dict) -> dict:
+    """Return a copy of settings with env values masked."""
+    out = dict(raw)
+    if "env" in out and isinstance(out["env"], dict):
+        out["env"] = {k: _MASKED for k in out["env"]}
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Collectors
 # ---------------------------------------------------------------------------
@@ -68,24 +79,45 @@ def collect_settings() -> dict:
     path = CLAUDE_DIR / "settings.json"
     if not path.exists():
         return {}
-    return json.loads(path.read_text())
+    try:
+        raw = json.loads(path.read_text())
+        return _mask_settings(raw)
+    except Exception as exc:
+        return {"_error": f"parse failed: {exc}"}
 
 
 def collect_settings_local() -> dict | None:
     path = CLAUDE_DIR / "settings.local.json"
     if not path.exists():
         return None
-    return json.loads(path.read_text())
+    try:
+        raw = json.loads(path.read_text())
+        return _mask_settings(raw)
+    except Exception as exc:
+        return {"_error": f"parse failed: {exc}"}
 
 
 def collect_hooks(settings: dict) -> dict:
+    errors: list[str] = []
     registered: list[dict] = []
+
+    if "_error" in settings:
+        return {
+            "registered": [],
+            "scripts": {},
+            "orphans": [],
+            "errors": [settings["_error"]],
+        }
+
     for event, blocks in settings.get("hooks", {}).items():
         for block in blocks:
             matcher = block.get("matcher", "")
             for hook in block.get("hooks", []):
                 cmd = hook.get("command", "")
-                script = Path(cmd.split()[-1]).name if cmd else ""
+                # Q2 fix: find last .py token instead of last token
+                parts = cmd.split()
+                py_parts = [p for p in parts if p.endswith(".py")]
+                script = Path(py_parts[-1]).name if py_parts else ""
                 registered.append(
                     {
                         "event": event,
@@ -102,10 +134,13 @@ def collect_hooks(settings: dict) -> dict:
 
     scripts: dict[str, dict] = {}
     for py in sorted(HOOKS_DIR.glob("*.py")):
-        rc, _ = run(["python3", "-m", "py_compile", str(py)])
+        rc, msg = run(["python3", "-m", "py_compile", str(py)])
+        ok = rc == 0
+        if not ok:
+            errors.append(f"syntax error in {py.name}: {msg}")
         scripts[py.name] = {
             "exists": True,
-            "syntax_ok": rc == 0,
+            "syntax_ok": ok,
             "orphan": py.name not in registered_scripts,
         }
 
@@ -113,6 +148,7 @@ def collect_hooks(settings: dict) -> dict:
         "registered": registered,
         "scripts": scripts,
         "orphans": [n for n, v in scripts.items() if v["orphan"]],
+        "errors": errors,
     }
 
 
@@ -171,29 +207,39 @@ def collect_kb() -> dict:
 
 
 def collect_health() -> dict:
-    # Syntax check
+    errors: list[str] = []
+
+    # Syntax check (already done in collect_hooks, but kept independent)
     syntax: dict[str, bool] = {}
     for py in sorted(HOOKS_DIR.glob("*.py")):
-        rc, _ = run(["python3", "-m", "py_compile", str(py)])
-        syntax[py.name] = rc == 0
+        rc, msg = run(["python3", "-m", "py_compile", str(py)])
+        ok = rc == 0
+        syntax[py.name] = ok
+        if not ok:
+            errors.append(f"syntax: {py.name}: {msg}")
 
     # Dependency binaries
     deps: dict[str, bool] = {}
     for binary in ["agent-notify", "mempalace", "ruff"]:
         rc, _ = run(["which", binary])
-        deps[binary] = rc == 0
+        ok = rc == 0
+        deps[binary] = ok
+        if not ok:
+            errors.append(f"missing binary: {binary}")
 
-    # guards/ package import
-    guards_ok = False
-    rc, _ = run(
+    # guards/ package import — use resolved HOOKS_DIR (S1 fix)
+    hooks_dir_str = str(HOOKS_DIR.resolve())
+    rc, msg = run(
         [
             "python3",
             "-c",
-            f"import sys; sys.path.insert(0,'{HOOKS_DIR}'); "
+            f"import sys; sys.path.insert(0,'{hooks_dir_str}'); "
             "from guards import bash,files,mcp_github,mcp_playwright,web",
         ]
     )
     guards_ok = rc == 0
+    if not guards_ok:
+        errors.append(f"guards/ import failed: {msg}")
 
     # context_inject.py live run
     inject_ok = False
@@ -206,14 +252,17 @@ def collect_health() -> dict:
             timeout=5,
         )
         inject_ok = r.returncode == 0 and r.stdout.strip().startswith("{")
-    except Exception:
-        pass
+        if not inject_ok:
+            errors.append(f"context_inject live test failed: {r.stderr.strip()[:100]}")
+    except Exception as exc:
+        errors.append(f"context_inject live test exception: {exc}")
 
     return {
         "syntax": syntax,
         "dependencies": deps,
         "guards_import": guards_ok,
         "context_inject_live": inject_ok,
+        "errors": errors,
     }
 
 
@@ -223,16 +272,24 @@ def collect_plugin_usage(settings: dict) -> dict[str, int]:
     cutoff = datetime.now() - timedelta(days=30)
     pattern = re.compile(r'"skill"\s*:\s*"([^"]+)"')
     counts: Counter = Counter()
+    errors: list[str] = []
+
     for jsonl in glob.glob(str(PROJECTS_DIR / "**" / "*.jsonl"), recursive=True):
         try:
             if datetime.fromtimestamp(os.path.getmtime(jsonl)) < cutoff:
                 continue
-            content = Path(jsonl).read_text(errors="replace")
-            for m in pattern.finditer(content):
-                counts[m.group(1)] += 1
-        except Exception:
-            pass
-    return dict(counts.most_common(30))
+            # Q3 fix: line-by-line streaming instead of full read_text
+            with open(jsonl, errors="replace") as fh:
+                for line in fh:
+                    for m in pattern.finditer(line):
+                        counts[m.group(1)] += 1
+        except Exception as exc:
+            errors.append(f"{Path(jsonl).name}: {exc}")
+
+    result = dict(counts.most_common(30))
+    if errors:
+        result["_errors"] = errors[:5]  # type: ignore[assignment]
+    return result
 
 
 def collect_mcp_processes() -> dict[str, int]:
@@ -248,13 +305,11 @@ def collect_mcp_processes() -> dict[str, int]:
         "brave",
         "duckdb",
     ]
-    pattern = re.compile("|".join(names))
     counts: Counter = Counter()
+    # Q1 fix: count each name at most once per process line
     for line in out.splitlines():
-        if not any(n in line for n in names):
-            continue
-        for m in pattern.finditer(line):
-            counts[m.group()] += 1
+        matched = {n for n in names if n in line}
+        counts.update(matched)
     return dict(counts)
 
 
@@ -288,23 +343,44 @@ def collect_project_state(top_n: int = 5) -> list[dict]:
 
 
 def main() -> None:
-    settings = collect_settings()
-    settings_local = collect_settings_local()
+    errors: list[str] = []
 
+    # D2 fix: wrap each collector — parse failure returns error dict, not crash
+    def safe(fn, *args, fallback=None):
+        try:
+            return fn(*args)
+        except Exception as exc:
+            errors.append(f"{fn.__name__}: {exc}")
+            return fallback() if callable(fallback) else fallback
+
+    settings = safe(collect_settings, fallback=dict)
+    settings_local = safe(collect_settings_local)
+    hooks = safe(collect_hooks, settings, fallback=dict)
+    skills = safe(collect_skills, fallback=list)
+    agents = safe(collect_agents, fallback=list)
+    commands = safe(collect_commands, fallback=list)
+    kb = safe(collect_kb, fallback=dict)
+    health = safe(collect_health, fallback=dict)
+    plugin_usage = safe(collect_plugin_usage, settings, fallback=dict)
+    mcp_processes = safe(collect_mcp_processes, fallback=dict)
+    project_state = safe(collect_project_state, fallback=list)
+
+    # D4 fix: surface collector-level errors in top-level "errors" key
     result = {
         "collected_at": datetime.now().isoformat(timespec="seconds"),
         "skip_usage": SKIP_USAGE,
+        "errors": errors,
         "settings": settings,
         "settings_local": settings_local,
-        "hooks": collect_hooks(settings),
-        "skills": collect_skills(),
-        "agents": collect_agents(),
-        "commands": collect_commands(),
-        "kb": collect_kb(),
-        "health": collect_health(),
-        "plugin_usage": collect_plugin_usage(settings),
-        "mcp_processes": collect_mcp_processes(),
-        "project_state_top5": collect_project_state(),
+        "hooks": hooks,
+        "skills": skills,
+        "agents": agents,
+        "commands": commands,
+        "kb": kb,
+        "health": health,
+        "plugin_usage": plugin_usage,
+        "mcp_processes": mcp_processes,
+        "project_state_top5": project_state,
     }
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
