@@ -343,6 +343,10 @@ def collect_project_state(top_n: int = 5) -> list[dict]:
 
 
 def main() -> None:
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print(__doc__)
+        sys.exit(0)
+
     errors: list[str] = []
 
     # D2 fix: wrap each collector — parse failure returns error dict, not crash
