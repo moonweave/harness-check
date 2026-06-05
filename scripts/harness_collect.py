@@ -27,6 +27,7 @@ COMMANDS_DIR = CLAUDE_DIR / "commands"
 PROJECTS_DIR = CLAUDE_DIR / "projects"
 KNOWLEDGE_DIR = CLAUDE_DIR / "knowledge"
 SKIP_USAGE = "--skip-usage" in sys.argv
+VERSION = "harness_collect.py 1.0.0"
 
 # Masked in JSON output to prevent leaking secrets into workspace_map.md / git
 _MASKED = "<masked>"
@@ -343,6 +344,10 @@ def collect_project_state(top_n: int = 5) -> list[dict]:
 
 
 def main() -> None:
+    if "--version" in sys.argv:
+        print(VERSION)
+        sys.exit(0)
+
     if "--help" in sys.argv or "-h" in sys.argv:
         print(__doc__)
         sys.exit(0)
